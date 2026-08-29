@@ -103,24 +103,16 @@ function pullFamily(text: string, tags: TagFamily): { text: string; blocks: MixE
     return { text, blocks };
 }
 
-/** 从 AI 原文剥离状态栏与小剧场块；漏写闭合（生成截断）时走行首开标签兜底 */
 /**
- * 流式过程中能安全显示的那一段正文。
- * 状态栏 / 小剧场块交给 extractMixBlocks 兜住——它认得"只开没关"的块，
- * 半张状态栏不会漏到正文里。机括的标记行（〔记〕这类）要等出杯后才被摘掉，
- * 流式里会先闪一下再消失，所以末尾那一行只要以 〔 或 [ 开头就先不显示：
- * 它要么是块的开头，要么是标记行，两种最终都不属于正文。
+ * 流式过程中显示的内容：原文一字不扣，照流。
+ * 状态栏/小剧场块、机括的标记行（〔选项〕〔记〕这类）全都原样流出来——
+ * 模型写到哪用户看到哪，任何扣留都会让画面在那几秒定格、看起来像卡死
+ * （机括标记行通常是回复最后一行，扣末尾行等于把整段收尾都藏了）。
+ * 落库那一刻块换成正式壳渲染、标记行被钩子摘走变成面板内容，
+ * 短暂的"变身"就是流式与成品之间该有的交接，不必藏。
  */
 export function mixStreamText(partial: string): string {
-    const lines = extractMixBlocks(String(partial ?? "")).text.split("\n");
-    // 从末尾往回剥：空行、以 〔 或 [ 开头的行都先不显示。
-    // 写完整的块已经被 extractMixBlocks 摘走了，还留在这儿的一定是没写完的。
-    while (lines.length) {
-        const tail = lines[lines.length - 1].trim();
-        if (tail === "" || /^[〔[]/.test(tail)) { lines.pop(); continue; }
-        break;
-    }
-    return lines.join("\n");
+    return String(partial ?? "");
 }
 
 export function extractMixBlocks(rawInput: string): {
@@ -164,8 +156,12 @@ export function extractMixTicket(raw: string): { text: string; ticketRaw?: strin
     return { text: result.text, ticketRaw: result.ticketRaw };
 }
 
-// 强调认全半角波浪号（模型两种都写）；对白/心声先整段匹配，强调再进去嵌套解析
-const INLINE_RE = /「([^」]*)」|\*([^*\n]+)\*|[~～]([^~～\n]+)[~～]/g;
+// 强调认全半角波浪号（模型两种都写）；对白同理兼容双引号——模型在长篇里经常
+// 滑回 “” / ""，认下来照样当对白渲染。只认这一层：存储一个字不改，正文永远是
+// 模型写的原样，回传给模型的历史也照旧。只吃单行、非空、不过长的一段，
+// 免得把跨段落的引号并成一大坨。
+// 对白/心声先整段匹配，强调再进去嵌套解析
+const INLINE_RE = /「([^」]*)」|[“"]([^”"\n]{1,200})[”"]|\*([^*\n]+)\*|[~～]([^~～\n]+)[~～]/g;
 const ACCENT_RE = /[~～]([^~～\n]+)[~～]/g;
 
 /** 把一段文字按 ~强调~ 拆成子段；没有强调返回 undefined（走整段渲染的旧路） */
@@ -192,9 +188,11 @@ function parseInline(line: string): MixProseSegment[] {
         if (match.index > cursor) {
             segments.push({ type: "narration", text: line.slice(cursor, match.index) });
         }
-        if (match[1] !== undefined) segments.push({ type: "dialogue", text: `「${match[1]}」`, inner: parseAccentRuns(match[1]) });
-        else if (match[2] !== undefined) segments.push({ type: "thought", text: match[2], inner: parseAccentRuns(match[2]) });
-        else segments.push({ type: "accent", text: match[3] });
+        // 「」与双引号都是对白，一律按「」渲染，看不出模型当时掉没掉格式
+        const said = match[1] ?? match[2];
+        if (said !== undefined) segments.push({ type: "dialogue", text: `「${said}」`, inner: parseAccentRuns(said) });
+        else if (match[3] !== undefined) segments.push({ type: "thought", text: match[3], inner: parseAccentRuns(match[3]) });
+        else segments.push({ type: "accent", text: match[4] });
         cursor = match.index + match[0].length;
     }
     if (cursor < line.length) {

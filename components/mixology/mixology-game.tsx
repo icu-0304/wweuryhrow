@@ -6,18 +6,21 @@
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { ChevronLeft, Copy, History, MoreHorizontal, Pencil, Plus, RotateCcw, Send, Sun, WandSparkles, X } from "lucide-react";
-import { continueMix, editMixTurn, generateMixReply, mixTurnRawText, refreshMixOpening, regenerateMixTail, rerollMixReply, runMixSessionEnd, truncateMixAfterTurn } from "@/lib/mixology/engine";
-import { getMixMaterial, getMixSession, listMixPickables, MIX_CABINET_UPDATED_EVENT, resolveMixRecipeMaterials, saveMixSession } from "@/lib/mixology/storage";
+import { continueMix, editMixTurn, generateMixReply, canReplayMixFrom, MIX_REPAIR_EVENT, MIX_STORE_SNAPSHOT_TURNS, mixTurnRawText, recordMixPanelStore, refreshMixOpening, regenerateMixTail, rerollMixReply, runMixEditSync, runMixSessionEnd, truncateMixAfterTurn, type MixRepairEventDetail } from "@/lib/mixology/engine";
+import { getMixMaterial, getMixSession, isMixBuiltinId, listMixPickables, MIX_CABINET_UPDATED_EVENT, resolveMixRecipeMaterials, saveMixMaterial, saveMixSession } from "@/lib/mixology/storage";
 import { applyMixMacros, MIX_DEFAULT_USER_NAME } from "@/lib/mixology/assembler";
 import { buildMixConditionContext, pickActiveMixMaterials } from "@/lib/mixology/state";
 import { scopeMixCss } from "@/lib/mixology/css-scope";
-import { MIX_KIND_LABELS, MIX_SLOT_ORDER, mixEncoreRenderHtml, mixPanelLayoutOf, mixSlotEntries, mixTurnEncoreBlocks, mixTurnTicketBlocks, type MixCharacterCard, type MixFilterRule, type MixMaterialKind, type MixMechanismMaterial, type MixPanelLayout, type MixSession, type MixSlotEntry, type MixState, type MixTicketMaterial, type MixTurn } from "@/lib/mixology/types";
+import { MIX_KIND_LABELS, MIX_SLOT_ORDER, mixEncoreRenderHtml, mixPanelLayoutOf, mixPanelSlotOf, mixSlotEntries, mixTurnEncoreBlocks, mixTurnTicketBlocks, type MixCharacterCard, type MixFilterRule, type MixMaterial, type MixMaterialKind, type MixMechanismMaterial, type MixPanelLayout, type MixSession, type MixSlotEntry, type MixState, type MixTicketMaterial, type MixTurn } from "@/lib/mixology/types";
 import { applyMixFilterRules, mixStreamText } from "@/lib/mixology/prose";
 import { MixProseView } from "./prose-view";
 import { MixRichText } from "./rich-text";
 import { KindGlyph, MixConfirm } from "./mixology-shared";
 import { MixTicketFrame } from "./ticket-frame";
-import { MixMechanismPanel } from "./mechanism-panel";
+import { MixMechanismInline, MixMechanismPanel } from "./mechanism-panel";
+import { MixSlotEditor } from "./slot-editor";
+import { MixMaterialEditor } from "./mixology-editor";
+import { disposeMixSandboxesForMaterial } from "@/lib/mixology/mechanism-runtime";
 
 /** 当前真正挂着的对局：严格模式的重复挂载靠它区分「真退出」与「假卸载」 */
 const liveMixGames = new Set<string>();
@@ -126,9 +129,48 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
     const liveFrameRef = useRef(0);
     const busyRef = useRef(false);
     const [editing, setEditing] = useState<{ id: string; draft: string } | null>(null);
+    /**
+     * 编辑弹层的键盘适配（iOS）：弹层高、输入框更高，键盘一出 WebKit 会滚动整页
+     * 去追光标，把弹层标题顶出屏幕（偶发，取决于光标位置与时序）。两手处理：
+     * ① 给遮罩垫 padding-bottom = 键盘高度，弹层整体抬到键盘上方（78% 上限
+     *    按剩余高度算，整个弹层都在可视区里，iOS 就没有追光标的理由）；
+     * ② 页面还是被蹭走的话（visualViewport 偏移/window 滚动），立刻拉回。
+     */
+    const editMaskRef = useRef<HTMLDivElement | null>(null);
+    useEffect(() => {
+        if (!editing || typeof window === "undefined") return;
+        const vv = window.visualViewport;
+        let raf = 0;
+        const sync = () => {
+            raf = 0;
+            const inset = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+            const mask = editMaskRef.current;
+            if (mask) mask.style.paddingBottom = inset > 40 ? `${inset}px` : "";
+            if (window.scrollY || (vv && vv.offsetTop > 1)) window.scrollTo(0, 0);
+        };
+        const request = () => { if (!raf) raf = requestAnimationFrame(sync); };
+        sync();
+        vv?.addEventListener("resize", request);
+        vv?.addEventListener("scroll", request);
+        window.addEventListener("scroll", request);
+        return () => {
+            if (raf) cancelAnimationFrame(raf);
+            vv?.removeEventListener("resize", request);
+            vv?.removeEventListener("scroll", request);
+            window.removeEventListener("scroll", request);
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- 只关心开/关，别在每次敲字时重挂监听
+    }, [Boolean(editing)]);
     const [confirm, setConfirm] = useState<{ type: "rewind" | "edit"; turnId: string } | null>(null);
     const [recipeOpen, setRecipeOpen] = useState(false);
+    /** 局内的叠层编辑：排序 / 生效条件 / 移除，和吧台同一套编辑器 */
+    const [slotEdit, setSlotEdit] = useState<MixMaterialKind | null>(null);
     const [slotPick, setSlotPick] = useState<MixMaterialKind | null>(null);
+    /**
+     * 局内材料编辑器：复用酒柜的创建弹窗（MixMaterialEditor），觉得哪里不对味
+     * 不用退出对局回酒柜改。slot 有值 = 从某格的「+」新建，保存后顺手放进那一格。
+     */
+    const [matEditor, setMatEditor] = useState<{ kind: MixMaterialKind; initial?: MixMaterial; slot?: MixMaterialKind } | null>(null);
     const [wheelIndex, setWheelIndex] = useState(0);
     /**
      * 酒柜外部变更计数：小卷（吉祥物工具）改完材料会广播这个事件，对局里的
@@ -141,6 +183,22 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
         window.addEventListener(MIX_CABINET_UPDATED_EVENT, bump);
         return () => window.removeEventListener(MIX_CABINET_UPDATED_EVENT, bump);
     }, []);
+    /**
+     * 状态栏补写提示：补写是流式结束后追加的一次模型往返，屏幕上没有任何
+     * 东西在动——引擎广播事件，这里挂一个半透明小 toast 告诉用户在补什么。
+     */
+    const [repairNote, setRepairNote] = useState<string | null>(null);
+    useEffect(() => {
+        const onRepair = (event: Event) => {
+            const detail = (event as CustomEvent<MixRepairEventDetail>).detail;
+            if (!detail || detail.sessionId !== sessionId) return;
+            setRepairNote(detail.done ? null : detail.name ?? "");
+        };
+        window.addEventListener(MIX_REPAIR_EVENT, onRepair);
+        return () => window.removeEventListener(MIX_REPAIR_EVENT, onRepair);
+    }, [sessionId]);
+    // 兜底：这轮怎么收场的都别让 toast 挂着（引擎侧异常路径已在 finally 里收过一道）
+    useEffect(() => { if (!busy) setRepairNote(null); }, [busy]);
     const scrollRef = useRef<HTMLDivElement | null>(null);
     const abortRef = useRef<AbortController | null>(null);
     const wheelRef = useRef<HTMLDivElement | null>(null);
@@ -237,6 +295,49 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
     }, [session, cabinetTick]);
 
     /**
+     * 按挂点分组：float 走悬浮层（老形态），header/inputbar-* 由宿主画按钮开合，
+     * flow-* 作为内嵌卡进滚动流。按钮与容器都是宿主画的，沙盒只管格子里的内容。
+     */
+    const slotGroups = useMemo(() => {
+        const groups = {
+            float: [] as typeof panels,
+            header: [] as typeof panels,
+            "inputbar-left": [] as typeof panels,
+            "inputbar-right": [] as typeof panels,
+            "flow-top": [] as typeof panels,
+            "flow-bottom": [] as typeof panels,
+        };
+        for (const item of panels) groups[mixPanelSlotOf(item.layout)].push(item);
+        return groups;
+    }, [panels]);
+
+    /**
+     * 回传轮数：默认不限（全部历史都发给模型），玩家在修改方案弹窗里调了才裁。
+     * 只裁请求内容，存储与界面回放完整；随对局保存。
+     */
+    const [histOpen, setHistOpen] = useState(false);
+    const setHistoryLimit = useCallback((limit: number | undefined) => {
+        const current = getMixSession(sessionId);
+        if (!current) return;
+        const next: MixSession = { ...current };
+        if (limit && limit > 0) next.historyLimit = Math.floor(limit);
+        else delete next.historyLimit;
+        saveMixSession(next);
+        setSession(getMixSession(sessionId));
+    }, [sessionId]);
+
+    /** 按钮位面板的开合，按局记忆；关着的不渲染（要留住的状态放机括存储桶） */
+    const dockOpen = session?.panelOpen ?? {};
+    const toggleDock = useCallback((materialId: string) => {
+        const current = getMixSession(sessionId);
+        if (!current) return;
+        const next = { ...(current.panelOpen ?? {}) };
+        next[materialId] = !next[materialId];
+        saveMixSession({ ...current, panelOpen: next });
+        setSession(getMixSession(sessionId));
+    }, [sessionId]);
+
+    /**
      * 机括界面的逃生口。摆放完全交给创作者之后，理论上存在"一块面板糊满整个屏幕、
      * 连输入框都点不到"的材料——不靠限制排版来防，靠这里一键收掉、一键归位。
      */
@@ -266,7 +367,8 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
     const handlePanelStore = useCallback((materialId: string, store: Record<string, string>) => {
         const current = getMixSession(sessionId);
         if (!current) return;
-        saveMixSession({ ...current, mechanismStore: { ...(current.mechanismStore ?? {}), [materialId]: store } });
+        // 手改记在当前这一轮上：日后编辑早先某轮重画时，走到这里会再盖一次
+        saveMixSession(recordMixPanelStore(current, materialId, store));
         setSession(getMixSession(sessionId));
     }, [sessionId]);
 
@@ -292,11 +394,15 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
         return vars as CSSProperties;
     }, [session?.state]);
 
+    /** 上一次 scroll 事件时的位置：撒手判定靠它识别滚动方向 */
+    const lastTopRef = useRef(0);
+
     /** 按当前落点滚一次 */
     const applyStick = useCallback(() => {
         const el = scrollRef.current;
         if (!el || stickRef.current === "free") return;
         el.scrollTop = stickRef.current === "top" ? 0 : el.scrollHeight;
+        lastTopRef.current = el.scrollTop;
     }, []);
 
     /**
@@ -361,13 +467,23 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
     const markGesture = useCallback(() => { gestureAtRef.current = Date.now(); }, []);
     const handleScroll = useCallback(() => {
         const el = scrollRef.current;
-        if (!el || stickRef.current === "free") return;
+        if (!el) return;
+        const prevTop = lastTopRef.current;
+        lastTopRef.current = el.scrollTop;
+        if (stickRef.current === "free") return;
         const gapTop = el.scrollTop;
         const gapBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
         const stuck = stickRef.current === "top" ? gapTop <= 8 : gapBottom <= 8;
         if (stuck) return;
-        // 1.6s 覆盖触摸惯性滚动的尾巴：手指离屏后 scroll 事件还会飘一阵
-        if (Date.now() - gestureAtRef.current < 1600) stickRef.current = "free";
+        // 用户意图两条通路缺一不可：
+        // ① 手势（滚轮/触摸/按压，1.6s 覆盖惯性尾巴）——但手指落在小票/小剧场/画布的
+        //    iframe 上时触摸事件被沙盒吃掉、不冒泡，外层什么都收不到；
+        // ② 方向启发兜住 ① 的盲区：贴底时 scrollTop 变小（在往上挪）、贴顶时变大，
+        //    只有用户滚动才会朝"背离锚点"的方向动——内容重排只会把落点甩远，不会反向。
+        const movedAway = stickRef.current === "bottom"
+            ? el.scrollTop < prevTop - 1
+            : el.scrollTop > prevTop + 1;
+        if (movedAway || Date.now() - gestureAtRef.current < 1600) stickRef.current = "free";
         else applyStick();
     }, [applyStick]);
 
@@ -492,6 +608,50 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
         return idx < 0 ? 0 : session.turns.length - idx - 1;
     };
 
+    /**
+     * 回溯到某一轮时机括能退到什么程度：
+     * exact = 那一轮留着快照，精确退回；oldest = 比保留窗口还早，只能退到现存最早的那份；
+     * none = 一份快照都没有（更新前的老对局），机括不动。
+     * 后两种要在弹窗里说明白，别让玩家以为机括也跟着回到了当时。
+     */
+    const mechanismRewindKind = (turnId: string): "exact" | "oldest" | "none" => {
+        const idx = session.turns.findIndex((t) => t.id === turnId);
+        if (idx < 0) return "exact";
+        if (session.turns.slice(0, idx + 1).some((t) => t.mechanismStore)) return "exact";
+        return session.turns.some((t) => t.mechanismStore) ? "oldest" : "none";
+    };
+
+    /** 本局有没有机括：没有就别拿这段说明打扰玩家 */
+    const hasMechanism = () => mixSlotEntries(session.recipe.slots, "mechanism")
+        .some((e) => getMixMaterial(e.materialId)?.kind === "mechanism");
+
+    const mechanismRewindHint = (turnId: string) => {
+        if (!hasMechanism()) return null;
+        const kind = mechanismRewindKind(turnId);
+        if (kind === "exact") return null;
+        return (
+            <>
+                <br />
+                {kind === "oldest"
+                    ? `机括存档仅保留最近 ${MIX_STORE_SNAPSHOT_TURNS} 轮，此轮已超出，机括数据将回退至现存最早的存档。`
+                    : "此轮无机括存档，机括数据不会回退。"}
+            </>
+        );
+    };
+
+    /**
+     * 保存这一条编辑会不会连带删掉后文。
+     * 玩家发言：后面的回复是冲着旧发言写的，要删掉重新生成。
+     * 角色回复：后面每一轮都能按原文重画时一条不删；重画不了才截断
+     *（它们的记住的值与机括存储都是从这一轮累积算出来的，重算不了就只能作废）。
+     */
+    const editWillTruncate = (turnId: string) => {
+        const idx = session.turns.findIndex((t) => t.id === turnId);
+        if (idx < 0 || idx === session.turns.length - 1) return false;
+        if (session.turns[idx].role === "user") return true;
+        return !canReplayMixFrom(session, idx);
+    };
+
     const doRewind = (turnId: string) => {
         try {
             truncateMixAfterTurn(sessionId, turnId);
@@ -515,7 +675,23 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
         // 编辑的是玩家发言：直接续生成新回复；编辑角色回复则到此为止
         if (target?.role === "user") {
             void run((signal, _commit, onDelta) => regenerateMixTail(sessionId, signal, onDelta));
+            return;
         }
+        // 编辑的是角色回复且本局带钩子机括：把新原文交给机括重新收数，不问、不弹窗。
+        // 机括的标记行只有它自己的钩子认得，不重跑就会留在正文里裸奔；而"要不要重跑"
+        // 从来不是玩家该决定的事——编辑完就该是编辑后的样子。
+        // 回滚基准由引擎自己找（前一轮的快照），这里不做判断。
+        if (target?.role === "assistant") doEditSync(editing.id);
+    };
+
+    const doEditSync = (turnId: string) => {
+        void runMixEditSync(sessionId, turnId).then((mode) => {
+            setSession(getMixSession(sessionId));
+            // 追加要说一声：这一轮太旧、快照已不在，机括那儿会被记成两笔
+            onToast(mode === "replayed" ? "已按编辑后的内容重跑这一轮及之后各轮。"
+                : mode === "appended" ? "已重跑这一轮（这一轮太旧，重画不了后文，已截断）。"
+                : "重跑失败，这一轮没有变化。");
+        });
     };
 
     /**
@@ -603,6 +779,18 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
         onToast("已清空这一格，下一轮生效。");
     };
 
+    // 本局小票里勾了「记住」的项：叠层编辑器里变量条件的可选项。
+    // 每次渲染现算——小票就几件，比为它多背一个 memo 依赖划算
+    const slotVarNames: string[] = [];
+    for (const entry of mixSlotEntries(session.recipe.slots, "ticket")) {
+        const mat = getMixMaterial(entry.materialId);
+        if (mat?.kind !== "ticket") continue;
+        for (const item of mat.vars ?? []) {
+            const name = item.name.trim();
+            if (name && !slotVarNames.includes(name)) slotVarNames.push(name);
+        }
+    }
+
     /**
      * 按块取皮：块的供稿材料还在场就用它现在的皮（原地改版全局换皮的特性保留）；
      * 不在场了优先用对局档案里的退役快照，档案缺失（老数据）再找酒柜里同 id 的
@@ -667,6 +855,19 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
             <div className="mix-game-header">
                 <button type="button" className="mix-icon-btn" onClick={onBack} aria-label="返回"><ChevronLeft size={20} /></button>
                 <div className="mix-game-title">{session.charName}</div>
+                {slotGroups.header.map(({ material, layout }) => (
+                    <button
+                        key={material.id}
+                        type="button"
+                        className="mix-icon-btn mix-slot-btn"
+                        data-on={dockOpen[material.id] ? "true" : undefined}
+                        onClick={() => toggleDock(material.id)}
+                        aria-label={material.name}
+                        title={material.name}
+                    >
+                        {layout.icon || "◈"}
+                    </button>
+                ))}
                 <button type="button" className="mix-icon-btn" onClick={() => setBgTuneOpen((v) => !v)} aria-label="背景观感" title="背景观感">
                     <Sun size={19} />
                 </button>
@@ -705,6 +906,24 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                 </>
             ) : null}
             <StateBar state={session.state ?? {}} />
+            {!panelsHidden && slotGroups.header.some(({ material }) => dockOpen[material.id]) ? (
+                <div className="mix-dock-drop" data-from="header">
+                    {slotGroups.header.filter(({ material }) => dockOpen[material.id]).map(({ material, layout }) => (
+                        <MixMechanismInline
+                            key={material.id}
+                            materialId={material.id}
+                            name={material.name}
+                            html={material.panelHtml ?? ""}
+                            state={session.state ?? {}}
+                            store={session.mechanismStore?.[material.id] ?? {}}
+                            plateDefault={layout.plate !== false}
+                            onStore={handlePanelStore}
+                            onState={handlePanelState}
+                            onSay={handlePanelSay}
+                        />
+                    ))}
+                </div>
+            ) : null}
             <div
                 className="mix-game-scroll"
                 ref={scrollRef}
@@ -720,6 +939,21 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                         <MixRichText text={assets.canvasHtml} />
                     </div>
                 ) : null}
+                {slotGroups["flow-top"].map(({ material, layout }) => (
+                    <div className="mix-flow-panel" data-at="top" key={material.id}>
+                        <MixMechanismInline
+                            materialId={material.id}
+                            name={material.name}
+                            html={material.panelHtml ?? ""}
+                            state={session.state ?? {}}
+                            store={session.mechanismStore?.[material.id] ?? {}}
+                            plateDefault={layout.plate !== false}
+                            onStore={handlePanelStore}
+                            onState={handlePanelState}
+                            onSay={handlePanelSay}
+                        />
+                    </div>
+                ))}
                 {session.turns.map((turn, idx) => {
                     const isLast = idx === session.turns.length - 1;
                     const actions = (
@@ -758,15 +992,30 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                         </div>
                     );
                 })() : null}
+                {slotGroups["flow-bottom"].map(({ material, layout }) => (
+                    <div className="mix-flow-panel" data-at="bottom" key={material.id}>
+                        <MixMechanismInline
+                            materialId={material.id}
+                            name={material.name}
+                            html={material.panelHtml ?? ""}
+                            state={session.state ?? {}}
+                            store={session.mechanismStore?.[material.id] ?? {}}
+                            plateDefault={layout.plate !== false}
+                            onStore={handlePanelStore}
+                            onState={handlePanelState}
+                            onSay={handlePanelSay}
+                        />
+                    </div>
+                ))}
                 {assets.encoreStatics.map((item) => (
                     <div className="mix-encore-inline" key={item.id}>
                         <MixRichText text={item.html} />
                     </div>
                 ))}
             </div>
-            {panels.length && !panelsHidden ? (
+            {slotGroups.float.length && !panelsHidden ? (
                 <div className="mix-panel-layer">
-                    {panels.map(({ material, layout }) => (
+                    {slotGroups.float.map(({ material, layout }) => (
                         <MixMechanismPanel
                             key={material.id}
                             materialId={material.id}
@@ -783,7 +1032,44 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                     ))}
                 </div>
             ) : null}
+            {!panelsHidden && [...slotGroups["inputbar-left"], ...slotGroups["inputbar-right"]].some(({ material }) => dockOpen[material.id]) ? (
+                <div className="mix-dock-drop" data-from="input">
+                    {[...slotGroups["inputbar-left"], ...slotGroups["inputbar-right"]].filter(({ material }) => dockOpen[material.id]).map(({ material, layout }) => (
+                        <MixMechanismInline
+                            key={material.id}
+                            materialId={material.id}
+                            name={material.name}
+                            html={material.panelHtml ?? ""}
+                            state={session.state ?? {}}
+                            store={session.mechanismStore?.[material.id] ?? {}}
+                            plateDefault={layout.plate !== false}
+                            onStore={handlePanelStore}
+                            onState={handlePanelState}
+                            onSay={handlePanelSay}
+                        />
+                    ))}
+                </div>
+            ) : null}
+            {repairNote !== null ? (
+                <div className="mix-repair-toast" role="status">
+                    <span className="mix-repair-dots" aria-hidden="true"><i /><i /><i /></span>
+                    {repairNote ? `「${repairNote}」状态栏补写中` : "状态栏补写中"}
+                </div>
+            ) : null}
             <div className="mix-game-inputbar">
+                {slotGroups["inputbar-left"].map(({ material, layout }) => (
+                    <button
+                        key={material.id}
+                        type="button"
+                        className="mix-icon-btn mix-slot-btn"
+                        data-on={dockOpen[material.id] ? "true" : undefined}
+                        onClick={() => toggleDock(material.id)}
+                        aria-label={material.name}
+                        title={material.name}
+                    >
+                        {layout.icon || "◈"}
+                    </button>
+                ))}
                 <button
                     type="button"
                     className="mix-icon-btn"
@@ -818,6 +1104,19 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                 >
                     <WandSparkles size={18} />
                 </button>
+                {slotGroups["inputbar-right"].map(({ material, layout }) => (
+                    <button
+                        key={material.id}
+                        type="button"
+                        className="mix-icon-btn mix-slot-btn"
+                        data-on={dockOpen[material.id] ? "true" : undefined}
+                        onClick={() => toggleDock(material.id)}
+                        aria-label={material.name}
+                        title={material.name}
+                    >
+                        {layout.icon || "◈"}
+                    </button>
+                ))}
                 <button type="button" className="mix-send-btn" onClick={handleSend} disabled={busy || !input.trim()} aria-label="发送">
                     <Send size={16} />
                 </button>
@@ -833,34 +1132,67 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                         </div>
                         <div className="mix-sheet-body">
                             <div className="mix-struct-note">只改这一局，下一轮生成时生效，已写出的内容不变；不影响吧台里保存的方案。</div>
-                            {panels.length ? (
-                                <div className="mix-panel-ops">
-                                    <button type="button" className="mix-dock-chip" data-on={panelsHidden ? "true" : undefined} onClick={() => setPanelsHidden((v) => !v)}>
-                                        {panelsHidden ? "显示机括界面" : "暂时收起机括界面"}
-                                    </button>
-                                    <button type="button" className="mix-dock-chip" onClick={() => { resetPanelBoxes(); onToast("机括界面已归位。"); }}>
-                                        界面归位
-                                    </button>
+                            <div className="mix-panel-ops">
+                                {panels.length ? (
+                                    <>
+                                        <button type="button" className="mix-dock-chip" data-on={panelsHidden ? "true" : undefined} onClick={() => setPanelsHidden((v) => !v)}>
+                                            {panelsHidden ? "显示机括界面" : "暂时收起机括界面"}
+                                        </button>
+                                        <button type="button" className="mix-dock-chip" onClick={() => { resetPanelBoxes(); onToast("机括界面已归位。"); }}>
+                                            界面归位
+                                        </button>
+                                    </>
+                                ) : null}
+                                <button
+                                    type="button"
+                                    className="mix-dock-chip"
+                                    data-on={session.historyLimit || histOpen ? "true" : undefined}
+                                    onClick={() => setHistOpen((v) => !v)}
+                                >
+                                    {session.historyLimit ? `回传近 ${session.historyLimit} 轮` : "回传全部历史"}
+                                </button>
+                            </div>
+                            {histOpen ? (
+                                <div className="mix-histlimit">
+                                    <span>回传轮数</span>
+                                    <input
+                                        type="range"
+                                        min={2}
+                                        max={60}
+                                        step={1}
+                                        value={session.historyLimit ?? 60}
+                                        onChange={(e) => setHistoryLimit(Number(e.target.value))}
+                                    />
+                                    <b>{session.historyLimit ?? "不限"}</b>
+                                    <button type="button" className="mix-dock-chip" onClick={() => setHistoryLimit(undefined)}>不限</button>
                                 </div>
                             ) : null}
-                            <div className="mix-bar-hint">左右滑动切换槽位 · 点击槽位换材料</div>
+                            <div className="mix-bar-hint">左右滑动切换槽位 · 点击槽位整理材料、顺序与生效条件</div>
                             <div className="mix-wheel" ref={wheelRef} onScroll={handleWheelScroll}>
                                 {MIX_SLOT_ORDER.map((kind) => {
                                     const stack = mixSlotEntries(session.recipe.slots, kind);
                                     const mat = stack[0] ? getMixMaterial(stack[0].materialId) : null;
                                     const extra = stack.length - 1;
                                     const locked = kind === "character";
+                                    // 角色卡本局不可换，但原地编辑放行（与酒柜同一条准入线：
+                                    // 官方出厂件、导入的别人的卡不给改）。引擎每轮从酒柜实时取卡，
+                                    // 改完下一轮生效，「同一件改版全局换皮」照旧
+                                    const charEditable = locked && mat ? !isMixBuiltinId(mat.id) && !mat.imported : false;
                                     return (
                                         <div
                                             className="mix-slot"
                                             data-filled={mat ? "true" : undefined}
-                                            data-locked={locked ? "true" : undefined}
+                                            data-locked={locked && !charEditable ? "true" : undefined}
                                             key={kind}
-                                            onClick={() => { if (!locked) setSlotPick(kind); }}
+                                            onClick={() => {
+                                                if (!locked) { setSlotEdit(kind); return; }
+                                                if (charEditable && mat) setMatEditor({ kind: "character", initial: mat });
+                                                else if (mat) onToast("官方出厂件和导入的别人的角色卡不能编辑。");
+                                            }}
                                         >
                                             <div className="mix-slot-kind">
                                                 <b>{MIX_KIND_LABELS[kind]}</b>
-                                                {locked ? <i>本局不可换</i> : <i>可留空</i>}
+                                                {locked ? <i>{charEditable ? "不可换 · 点击编辑" : "本局不可换"}</i> : <i>可留空</i>}
                                             </div>
                                             <div className="mix-slot-body">
                                                 {mat ? (
@@ -900,6 +1232,21 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                 </div>
             ) : null}
 
+            {/* 局内叠层编辑：与吧台同一套（排序 / 生效条件 / 移除），改动即存、下一轮生效 */}
+            {slotEdit ? (
+                <MixSlotEditor
+                    kind={slotEdit}
+                    entries={mixSlotEntries(session.recipe.slots, slotEdit)}
+                    resolve={(id) => getMixMaterial(id)}
+                    varNames={slotVarNames}
+                    onChange={(next) => writeSlot(slotEdit, next)}
+                    onPickMore={() => setSlotPick(slotEdit)}
+                    onEdit={(material) => setMatEditor({ kind: material.kind, initial: material })}
+                    onCreate={() => setMatEditor({ kind: slotEdit, slot: slotEdit })}
+                    onClose={() => setSlotEdit(null)}
+                />
+            ) : null}
+
             {slotPick ? (
                 <div className="mix-sheet-mask" onClick={() => setSlotPick(null)}>
                     <div className="mix-sheet" onClick={(e) => e.stopPropagation()}>
@@ -907,6 +1254,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                             <div className="mix-sheet-title">
                                 {MIX_KIND_LABELS[slotPick]} · 已放 {mixSlotEntries(session.recipe.slots, slotPick).length} 件
                             </div>
+                            <button type="button" className="mix-icon-btn" onClick={() => setMatEditor({ kind: slotPick, slot: slotPick })} aria-label={`自建一件${MIX_KIND_LABELS[slotPick]}`} title={`自建一件${MIX_KIND_LABELS[slotPick]}`}><Plus size={18} /></button>
                             <button type="button" className="mix-icon-btn" onClick={() => setSlotPick(null)} aria-label="关闭"><X size={18} /></button>
                         </div>
                         <div className="mix-sheet-body">
@@ -934,12 +1282,71 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                                             </div>
                                             {m.hook ? <div className="mix-mat-hook">{m.hook}</div> : null}
                                         </div>
+                                        {/* 与酒柜同一条准入线：官方出厂件、从酒材页拿来的别人的材料都不给编辑 */}
+                                        {!isMixBuiltinId(m.id) && !m.imported ? (
+                                            <button
+                                                type="button"
+                                                className="mix-icon-btn"
+                                                style={{ flex: "0 0 auto", alignSelf: "center" }}
+                                                onClick={(e) => { e.stopPropagation(); setMatEditor({ kind: m.kind, initial: m }); }}
+                                                aria-label="编辑"
+                                            >
+                                                <Pencil size={15} />
+                                            </button>
+                                        ) : null}
                                     </div>
                                 ))}
                                 {listMixPickables(slotPick).length === 0 ? (
-                                    <div className="mix-comment-empty">酒柜里还没有{MIX_KIND_LABELS[slotPick]}——去酒柜页自建一件。</div>
+                                    <div className="mix-comment-empty">酒柜里还没有{MIX_KIND_LABELS[slotPick]}——点右上角的「+」现场自建一件。</div>
                                 ) : null}
                             </div>
+                        </div>
+                    </div>
+                </div>
+            ) : null}
+
+            {/* 局内材料编辑/新建：复用酒柜的创建弹窗。保存逻辑与酒柜同款——
+                保留云端发布关联、机括改完收掉旧沙盒；从「+」新建的顺手放进那一格 */}
+            {matEditor ? (
+                <div className="mix-sheet-mask">
+                    <div className="mix-sheet" style={{ maxHeight: "92%" }} onClick={(e) => e.stopPropagation()}>
+                        <div className="mix-sheet-head">
+                            <div className="mix-sheet-title">{matEditor.initial ? "编辑" : "自建"}{MIX_KIND_LABELS[matEditor.kind]}</div>
+                            <button type="button" className="mix-icon-btn" onClick={() => setMatEditor(null)} aria-label="关闭"><X size={18} /></button>
+                        </div>
+                        <div className="mix-sheet-body">
+                            <MixMaterialEditor
+                                key={matEditor.initial?.id ?? "new"}
+                                kind={matEditor.kind}
+                                initial={matEditor.initial}
+                                onSave={(material) => {
+                                    // 编辑器不经手发布记账字段，保存时从原件带回来，别把云端关联弄丢
+                                    saveMixMaterial(matEditor.initial?.publishedId
+                                        ? { ...material, publishedId: matEditor.initial.publishedId, publishedAt: matEditor.initial.publishedAt }
+                                        : material);
+                                    // 机括改完，正在跑的沙盒里还是老代码——收掉，下次调用重建
+                                    if (material.kind === "mechanism") disposeMixSandboxesForMaterial(material.id);
+                                    if (matEditor.slot && !matEditor.initial) {
+                                        // 从「+」现场新建的就是为这一格建的：保存即入格，排在已有的后面
+                                        writeSlot(matEditor.slot, [...mixSlotEntries(session.recipe.slots, matEditor.slot), { materialId: material.id }]);
+                                        onToast(`「${material.name}」已入柜并放进本局，下一轮生效。`);
+                                    } else {
+                                        if (material.kind === "character" && material.id === mixSlotEntries(session.recipe.slots, "character")[0]?.materialId) {
+                                            // 改的是本局这张角色卡：charName 快照要对齐——生成时的
+                                            // meta 与机括钩子读的都是快照，不是酒柜里的实时卡；
+                                            // 还没开口的局顺手把开场白换成新版（refreshMixOpening 自己判）
+                                            const fresh = getMixSession(sessionId);
+                                            const nextName = material.charName.trim() || material.name;
+                                            if (fresh && nextName && nextName !== fresh.charName) saveMixSession({ ...fresh, charName: nextName });
+                                            refreshMixOpening(sessionId);
+                                        }
+                                        setSession(getMixSession(sessionId));
+                                        onToast(`「${material.name}」已更新，下一轮生效。`);
+                                    }
+                                    setMatEditor(null);
+                                }}
+                                onCancel={() => setMatEditor(null)}
+                            />
                         </div>
                     </div>
                 </div>
@@ -949,7 +1356,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
             {editing ? (() => {
                 const editingTurn = session.turns.find((t) => t.id === editing.id);
                 return (
-                    <div className="mix-sheet-mask" onClick={() => setEditing(null)}>
+                    <div className="mix-sheet-mask" ref={editMaskRef} onClick={() => setEditing(null)}>
                         <div className="mix-sheet" onClick={(e) => e.stopPropagation()}>
                             <div className="mix-sheet-head">
                                 <div className="mix-sheet-title">编辑消息</div>
@@ -973,7 +1380,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                                         type="button"
                                         className="mix-pill-btn"
                                         onClick={() => {
-                                            if (laterCount(editing.id) > 0) setConfirm({ type: "edit", turnId: editing.id });
+                                            if (editWillTruncate(editing.id)) setConfirm({ type: "edit", turnId: editing.id });
                                             else saveEdit();
                                         }}
                                     >
@@ -990,7 +1397,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                 <MixConfirm
                     title={confirm.type === "rewind" ? "回溯到这条消息？" : "保存修改？"}
                     body={confirm.type === "rewind"
-                        ? `这条消息之后的 ${laterCount(confirm.turnId)} 条内容将被删除。`
+                        ? <>这条消息之后的 {laterCount(confirm.turnId)} 条内容将被删除。{mechanismRewindHint(confirm.turnId)}</>
                         : `保存后，这条消息之后的 ${laterCount(confirm.turnId)} 条内容将被删除${session.turns.find((t) => t.id === confirm.turnId)?.role === "user" ? "，并重新生成回复" : ""}。`}
                     confirmText={confirm.type === "rewind" ? "回溯" : "保存"}
                     tone="danger"
@@ -1003,6 +1410,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                     }}
                 />
             ) : null}
+
         </div>
     );
 }
